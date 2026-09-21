@@ -95,12 +95,26 @@ ULONG get_clock_divider(ULONG base_clock, ULONG target_rate)
 // Switch the clock rate whilst running
 int switch_clock_rate(ULONG base_clock, ULONG target_rate, struct WiFiBase *WiFiBase)
 {
+    struct ExecBase *SysBase = WiFiBase->w_SysBase;   /* bug() needs it */
+
     // Decide on an appropriate divider
     ULONG divider = get_clock_divider(base_clock, target_rate);
 
-    // Wait for the command inhibit (CMD and DAT) bits to clear
-    while(rd32(WiFiBase->w_SDIOBase, EMMC_STATUS) & 0x3)
-        delay_us(1000, WiFiBase);
+    // Wait for the command inhibit (CMD and DAT) bits to clear -- bounded, or
+    // it hangs whichever task called in, which on the inline BeginIO path is
+    // the caller's, not ours.
+    {
+        ULONG tout = 1000;                      /* 1000 x 1000us = 1 second */
+        while(rd32(WiFiBase->w_SDIOBase, EMMC_STATUS) & 0x3)
+        {
+            if (tout-- == 0)
+            {
+                D(bug("[WiFi] switch_clock_rate: controller stayed busy for 1s\n"));
+                return -1;
+            }
+            delay_us(1000, WiFiBase);
+        }
+    }
 
     // Set the SD clock off
     ULONG control1 = rd32(WiFiBase->w_SDIOBase, EMMC_CONTROL1);
@@ -128,9 +142,20 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct SDIO *sdio)
 
     sdio->s_LastCMDSuccess = 0;
 
-    // Check Command Inhibit
-    while(rd32(sdio->s_SDIO, EMMC_STATUS) & 0x1)
-        delay_us(10, sdio->s_WiFiBase);
+    // Check Command Inhibit -- bounded. s_LastCMDSuccess is already 0, so
+    // returning reports the failure through the existing path.
+    {
+        ULONG tout = 100000;                    /* 100000 x 10us = 1 second */
+        while(rd32(sdio->s_SDIO, EMMC_STATUS) & 0x1)
+        {
+            if (tout-- == 0)
+            {
+                D(bug("[WiFi] cmd_int: command inhibit never cleared\n"));
+                return;
+            }
+            delay_us(10, sdio->s_WiFiBase);
+        }
+    }
 
     // Is the command with busy?
     if((cmd & SD_CMD_RSPNS_TYPE_MASK) == SD_CMD_RSPNS_TYPE_48B)
@@ -142,9 +167,19 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct SDIO *sdio)
         {
             // Not an abort command
 
-            // Wait for the data line to be free
-            while(rd32(sdio->s_SDIO, EMMC_STATUS) & 0x2)
-                delay_us(10, sdio->s_WiFiBase);
+            // Wait for the data line to be free -- bounded, as above.
+            {
+                ULONG tout = 100000;            /* 100000 x 10us = 1 second */
+                while(rd32(sdio->s_SDIO, EMMC_STATUS) & 0x2)
+                {
+                    if (tout-- == 0)
+                    {
+                        D(bug("[WiFi] cmd_int: data line never became free\n"));
+                        return;
+                    }
+                    delay_us(10, sdio->s_WiFiBase);
+                }
+            }
         }
     }
 

@@ -731,8 +731,16 @@ ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
             struct PacketCmd *cmd = (APTR)&buffer[pkt->c_DataOffset];
 
             // Go through control wait list. If message is found with given ID, reply it
-            // No need to lock the list, it is accessed only in this task
             struct PacketMessage *m;
+
+            /*
+             * Forbid() because these messages are no longer this task's alone:
+             * a caller whose command times out clears pm_RecvBuffer from its
+             * own task. Without holding it here the guard below can already be
+             * in a register when that write lands, and the copy goes through a
+             * pointer whose owner has gone.
+             */
+            Forbid();
             ForeachNode(sdio->s_CtrlWaitList, m)
             {
                 struct PacketCmd *c = (APTR)m->pm_PacketData;
@@ -773,6 +781,7 @@ ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
                     break;
                 }
             }
+            Permit();
             break;
         }
 
@@ -1743,6 +1752,126 @@ static int int_strlen(const char *c)
     return len;
 }
 
+/* A healthy chip answers in milliseconds. */
+#define PACKET_CMD_TIMEOUT_SECS 5
+
+/*
+ * Give up on a command the firmware has not answered.
+ *
+ * The message cannot be recalled -- it is on s_CtrlWaitList, or still on the
+ * receiver's port, or in the receiver's hands between the two -- so it has to
+ * stay allocated for ever. Two things must be neutralised before walking away.
+ *
+ * pm_RecvBuffer points at memory the CALLER owns: a stack local, or an
+ * application's ios2_StatData, released as soon as the IORequest is replied.
+ * ProcessPacket() copies a late reply straight through it, so clear it and let
+ * that guarded copy be skipped.
+ *
+ * The port holds a signal bit belonging to the CALLING task. PA_IGNORE makes a
+ * late ReplyMsg() queue without signalling, so the bit can go back: otherwise
+ * every timeout costs that task one of its 32 signals, and a reply arriving
+ * after it exits would signal a freed Task.
+ *
+ * Caller must hold Forbid().
+ */
+static void PacketAbandonCmd(struct ExecBase *SysBase, struct MsgPort *port,
+                             struct PacketMessage *mpkt)
+{
+    BYTE sigbit = port->mp_SigBit;
+
+    if (mpkt != NULL)
+    {
+        mpkt->pm_RecvBuffer = NULL;
+        mpkt->pm_RecvSize = 0;
+    }
+
+    port->mp_Flags = PA_IGNORE;
+    port->mp_SigTask = NULL;
+    port->mp_SigBit = -1;
+
+    if (sigbit >= 0)
+    {
+        SetSignal(0, 1UL << sigbit);
+        FreeSignal(sigbit);
+    }
+}
+
+/*
+ * Wait for the receiver task to reply, but not for ever. These helpers run on
+ * the caller's task via WiFi_BeginIO()'s inline path -- for a TCP/IP stack that
+ * is its network task -- so a bare WaitPort() parks the caller in this driver
+ * permanently if the chip stops answering.
+ *
+ * Returns 1 if a reply arrived, 0 on timeout with the port abandoned.
+ */
+static int PacketWaitReply(struct SDIO *sdio, struct MsgPort *port,
+                           struct PacketMessage *mpkt, ULONG secs)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct MsgPort *tport;
+    struct timerequest *treq;
+    ULONG portmask, timmask, got;
+    int replied = 0;
+
+    tport = CreateMsgPort();
+    treq = tport ? (struct timerequest *)CreateIORequest(tport, sizeof(struct timerequest)) : NULL;
+    if (treq != NULL &&
+        OpenDevice((CONST_STRPTR)"timer.device", UNIT_VBLANK, (struct IORequest *)treq, 0) != 0)
+    {
+        DeleteIORequest((struct IORequest *)treq);
+        treq = NULL;
+    }
+    if (treq == NULL)
+    {
+        /* No timer: fall back to the unbounded wait, no worse than before. */
+        D(bug("[WiFi] no timer.device -- command wait is unbounded\n"));
+        if (tport) DeleteMsgPort(tport);
+        WaitPort(port);
+        return 1;
+    }
+
+    treq->tr_node.io_Command = TR_ADDREQUEST;
+    treq->tr_time.tv_secs = secs;
+    treq->tr_time.tv_micro = 0;
+    SendIO((struct IORequest *)treq);
+
+    portmask = 1UL << port->mp_SigBit;
+    timmask = 1UL << tport->mp_SigBit;
+
+    for (;;)
+    {
+        got = Wait(portmask | timmask);
+        /* Test the queue, not the signal: the reply may already have arrived. */
+        if (port->mp_MsgList.lh_TailPred != (struct Node *)&port->mp_MsgList)
+        {
+            replied = 1;
+            break;
+        }
+        if (got & timmask)
+            break;
+    }
+
+    if (!CheckIO((struct IORequest *)treq))
+        AbortIO((struct IORequest *)treq);
+    WaitIO((struct IORequest *)treq);
+    CloseDevice((struct IORequest *)treq);
+    DeleteIORequest((struct IORequest *)treq);
+    DeleteMsgPort(tport);
+
+    if (!replied)
+    {
+        /* Forbid() against the receiver task replying as we decide. */
+        Forbid();
+        if (port->mp_MsgList.lh_TailPred != (struct Node *)&port->mp_MsgList)
+            replied = 1;          /* beat us to it after all */
+        else
+            PacketAbandonCmd(SysBase, port, mpkt);
+        Permit();
+    }
+
+    return replied;
+}
+
 int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int setSize)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -1803,7 +1932,13 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
     CopyMem((APTR)setBuffer, &param[varSize], setSize);
 
     PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
-    WaitPort(port);
+    if (!PacketWaitReply(sdio, port, mpkt, PACKET_CMD_TIMEOUT_SECS))
+    {
+        D(bug("[WiFi] no answer from the firmware in %ld s -- giving up\n",
+              (ULONG)PACKET_CMD_TIMEOUT_SECS));
+        /* Receiver task still owns mpkt; leaked on purpose. */
+        return 1;
+    }
     GetMsg(port);
 
     if (c->c_Flags & LE16(BCDC_DCMD_ERROR))
@@ -1940,7 +2075,13 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     *param = LE32(cmdValue);
 
     PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
-    WaitPort(port);
+    if (!PacketWaitReply(sdio, port, mpkt, PACKET_CMD_TIMEOUT_SECS))
+    {
+        D(bug("[WiFi] no answer from the firmware in %ld s -- giving up\n",
+              (ULONG)PACKET_CMD_TIMEOUT_SECS));
+        /* Receiver task still owns mpkt; leaked on purpose. */
+        return 1;
+    }
     GetMsg(port);
 
     if (c->c_Flags & LE16(BCDC_DCMD_ERROR))
@@ -2065,7 +2206,13 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
         //PacketDump(sdio, p, "WiFi");
 
         PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
-        WaitPort(port);
+        if (!PacketWaitReply(sdio, port, mpkt, PACKET_CMD_TIMEOUT_SECS))
+        {
+            D(bug("[WiFi] no answer from the firmware in %ld s -- giving up\n",
+                  (ULONG)PACKET_CMD_TIMEOUT_SECS));
+            /* Receiver task still owns mpkt; leaked on purpose. */
+            return 1;
+        }
         GetMsg(port);
 
         if (c->c_Flags & LE16(BCDC_DCMD_ERROR))
@@ -2153,7 +2300,13 @@ int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
     CopyMem(varName, &param[0], varSize);
 
     PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
-    WaitPort(port);
+    if (!PacketWaitReply(sdio, port, mpkt, PACKET_CMD_TIMEOUT_SECS))
+    {
+        D(bug("[WiFi] no answer from the firmware in %ld s -- giving up\n",
+              (ULONG)PACKET_CMD_TIMEOUT_SECS));
+        /* Receiver task still owns mpkt; leaked on purpose. */
+        return 1;
+    }
     GetMsg(port);
 
     if (c->c_Flags & LE16(BCDC_DCMD_ERROR))

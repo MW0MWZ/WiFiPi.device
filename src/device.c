@@ -316,6 +316,26 @@ void WiFi_BeginIO(REGARG(struct IOSana2Req * io, "a1"))
     }
 }
 
+/*
+ * Remove() unlinks through ln_Succ/ln_Pred, so calling it on a node that is on
+ * no list writes through stale pointers into unrelated memory. A request being
+ * handled inline by WiFi_BeginIO() is exactly that: IOF_QUICK cleared and
+ * ln_Type NT_MESSAGE, but never queued.
+ */
+static int RequestQueuedOn(struct MsgPort *port, struct Node *node)
+{
+    struct Node *n;
+
+    if (port == NULL)
+        return 0;
+
+    for (n = port->mp_MsgList.lh_Head; n->ln_Succ != NULL; n = n->ln_Succ)
+        if (n == node)
+            return 1;
+
+    return 0;
+}
+
 LONG WiFi_AbortIO(REGARG(struct IOSana2Req *io, "a1"))
 {
     struct WiFiBase *WiFiBase = (struct WiFiBase *)io->ios2_Req.io_Device;
@@ -324,14 +344,52 @@ LONG WiFi_AbortIO(REGARG(struct IOSana2Req *io, "a1"))
     /* AbortIO is a *wish* call. Someone would like to abort current IORequest */
     if (io->ios2_Req.io_Unit != NULL)
     {
+        struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
+        struct Node *node = &io->ios2_Req.io_Message.mn_Node;
+
         Forbid();
         /* If the IO was not quick and is of type message (not handled yet or in process), abord it and remove from queue */
         if ((io->ios2_Req.io_Flags & IOF_QUICK) == 0 && io->ios2_Req.io_Message.mn_Node.ln_Type == NT_MESSAGE)
         {
-            Remove(&io->ios2_Req.io_Message.mn_Node);
-            io->ios2_Req.io_Error = IOERR_ABORTED;
-            io->ios2_WireError = S2WERR_GENERIC_ERROR;
-            ReplyMsg(&io->ios2_Req.io_Message);
+            /* ...and only if it is genuinely on one of our queues: those two
+             * flags are equally true of a request being handled inline. */
+            struct MsgPort *found = NULL;
+            struct Opener *opener;
+
+            if (RequestQueuedOn(unit->wu_CmdQueue, node))
+                found = unit->wu_CmdQueue;
+
+            if (found == NULL && WiFiBase->w_SDIO != NULL &&
+                RequestQueuedOn(WiFiBase->w_SDIO->s_SenderPort, node))
+                found = WiFiBase->w_SDIO->s_SenderPort;
+
+            /* S2_GETNETWORKS parks the request here until the receiver task
+             * starts a scan. */
+            if (found == NULL && RequestQueuedOn(unit->wu_ScanQueue, node))
+                found = unit->wu_ScanQueue;
+
+            if (found == NULL)
+            {
+                for (opener = (struct Opener *)unit->wu_Openers.mlh_Head;
+                     opener->o_Node.mln_Succ != NULL;
+                     opener = (struct Opener *)opener->o_Node.mln_Succ)
+                {
+                    if (RequestQueuedOn(&opener->o_ReadPort, node))
+                    { found = &opener->o_ReadPort; break; }
+                    if (RequestQueuedOn(&opener->o_OrphanListeners, node))
+                    { found = &opener->o_OrphanListeners; break; }
+                    if (RequestQueuedOn(&opener->o_EventListeners, node))
+                    { found = &opener->o_EventListeners; break; }
+                }
+            }
+
+            if (found != NULL)
+            {
+                Remove(node);
+                io->ios2_Req.io_Error = IOERR_ABORTED;
+                io->ios2_WireError = S2WERR_GENERIC_ERROR;
+                ReplyMsg(&io->ios2_Req.io_Message);
+            }
         }
         Permit();
     }

@@ -830,7 +830,14 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
         D(bug("[WiFi] Stopping clock...\n"));
         wr32((void*)0xf2101000, 0x80, 0x5a000000 | (rd32((void*)0xf2101000, 0x80) & ~0x10));
 
-        while(rd32((void*)0xf2101000, 0x80) & 0x80);
+        /* Bounded: an unbounded spin here hangs the opening task at init.
+         * Warn and carry on -- a later failure is at least diagnosable. */
+        {
+            ULONG tout = 1000000;
+            while((rd32((void*)0xf2101000, 0x80) & 0x80) && tout--) ;
+            if (tout == 0)
+                D(bug("[WiFi] GPCLK2 BUSY never cleared -- carrying on anyway\n"));
+        }
 
         D(bug("[WiFi] Clock stopped, GP2CTL = %08lx...\n", rd32((void*)0xf2101000, 0x80)));
 
@@ -841,7 +848,13 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
         D(bug("[WiFi] Starting clock...\n"));
         wr32((void*)0xf2101000, 0x80, 0x5a000000 | (rd32((void*)0xf2101000, 0x80) | 0x10));
 
-        while(0 == (rd32((void*)0xf2101000, 0x80) & 0x80));
+        /* Bounded, as above -- waiting for BUSY to come up this time. */
+        {
+            ULONG tout = 1000000;
+            while((0 == (rd32((void*)0xf2101000, 0x80) & 0x80)) && tout--) ;
+            if (tout == 0)
+                D(bug("[WiFi] GPCLK2 never started -- carrying on anyway\n"));
+        }
 
         D(bug("[WiFi] Clock is up...\n"));
 
